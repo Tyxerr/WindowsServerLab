@@ -37,6 +37,133 @@ The PowerShell I ran, cleaned up and in order, is in [`scripts/`](scripts):
 | [04-recovery-and-security.ps1](scripts/04-recovery-and-security.ps1) | AD Recycle Bin restore, fine-grained password policy, BitLocker keys to AD |
 | [05-pki-rds.ps1](scripts/05-pki-rds.ps1) | Enterprise Root CA, duplicated Web Server template, binding the cert to RDS and the RDP listener, loopback policy |
 
+## Build walkthrough
+
+Screenshots from the build, grouped by task. Each one shows the command and what it returned. Click a section to expand it.
+
+<details>
+<summary><b>Hyper-V: base image, VMs, conversion</b></summary>
+
+![Base image and differencing disks](screenshots/build/01-hyperv-base-image-differencing-disks.jpg)
+Boots the base VM from the Server 2022 ISO, marks `Base2022.vhdx` read-only after sysprep, then one `foreach` gives DC01, DC02, FS01, FS02 and STOR01 a differencing disk, a Gen 2 VM on LabNet, 2 vCPUs and 1-4 GB dynamic memory.
+
+![Windows 11 VM with vTPM](screenshots/build/02-win11-vtpm-dvd-path-error.jpg)
+Windows 11 requires a TPM: `Set-VMKeyProtector -NewLocalKeyProtector` + `Enable-VMTPM` gives CL01 a virtual one. `Add-VMDvdDrive -Path L:` fails because it wants the ISO file, not a drive letter.
+
+![VHDX to VMDK and back](screenshots/build/23-hyperv-vmware-qemu-conversion.jpg)
+`qemu-img convert` turns LNX01's VHDX into a VMDK (VMware format) and back into a dynamic VHDX. A new Gen 2 VM boots from the converted disk once its Secure Boot template is set to `MicrosoftUEFICertificateAuthority` (required for Linux).
+
+</details>
+
+<details>
+<summary><b>DNS and DHCP</b></summary>
+
+![Reverse zone and SRV lookup](screenshots/build/03-dns-reverse-zone-srv-check.jpg)
+`Add-DnsServerPrimaryZone` creates the 10.10.10.x reverse zone. The SRV lookup on `_ldap._tcp.dc._msdcs.lab.local` returns both DCs, which is how clients find a domain controller.
+
+![DHCP failover](screenshots/build/04-dhcp-failover-scope-error.jpg)
+Installs DHCP, authorizes it in AD, creates the scope and its router/DNS options, then sets up 50/50 failover with DC02. The first attempt failed because the scope already existed on DC02. Failover creates it on the partner by itself, so it should only exist on DC01.
+
+</details>
+
+<details>
+<summary><b>Active Directory: OUs, users, FSMO, health</b></summary>
+
+![OUs, groups, CSV import, redircmp](screenshots/build/06-ou-groups-csv-redircmp.jpg)
+One paste builds the Lab OU tree, the Eng and LinuxAdmins groups, and users from `users.csv`. `redircmp` makes new computer accounts land in Workstations.
+
+![Users in ADUC](screenshots/build/07-aduc-bulk-users.jpg)
+The CSV import result in ADUC.
+
+![CL01 in Workstations](screenshots/build/08-aduc-cl01-in-workstations.jpg)
+CL01 joined the domain and landed in Workstations, where the workstation GPOs are linked.
+
+![FSMO transfer](screenshots/build/05-fsmo-transfer-retry.jpg)
+Moves all five FSMO roles back to DC01 (`0,1,2,3,4`). The first try returned "directory service is unavailable"; the retry worked and `netdom query fsmo` confirms DC01 holds every role.
+
+![DC03 promote, FSMO move, functional level](screenshots/build/20-dc03-fsmo-and-functional-level.jpg)
+DC replacement drill: replication is clean across DC01-03 (`repadmin /replsummary`), the roles move to DC03, and after demoting DC03 only DC01 and DC02 remain at the 2016 domain and forest functional level.
+
+![dcdiag](screenshots/build/09-dcdiag-dfsrevent.jpg)
+`dcdiag /v` on a freshly promoted DC. DFSREvent fails on warnings from the first 24 hours after SYSVOL was shared, which is normal right after promotion.
+
+![Recycle Bin restore](screenshots/build/12-recycle-bin-restore.jpg)
+Turns on the AD Recycle Bin (can't be undone), deletes user1, restores it with `Restore-ADObject`, and shows its Eng group membership came back too.
+
+</details>
+
+<details>
+<summary><b>Group Policy</b></summary>
+
+![Central ADMX store](screenshots/build/10-admx-central-store.jpg)
+Copies `PolicyDefinitions` into SYSVOL. GPMC then reads "Policy definitions (ADMX files) retrieved from the central store", so every admin edits with the same templates.
+
+![BitLocker GPO](screenshots/build/13-gpo-bitlocker-ad-escrow.jpg)
+`WS - Bitlocker` saves the 48-digit recovery password and key package to AD for OS drives. The other GPOs in the tree are named by scope (WS = workstation, USR = user).
+
+![Trusted Sites](screenshots/build/15-gpo-trusted-sites.jpg)
+Site to Zone Assignment puts `https://*.lab.local` in zone 2 (Trusted Sites) for every domain machine.
+
+![Loopback processing](screenshots/build/24-gpo-loopback-replace.jpg)
+Loopback in Replace mode for the session hosts: users logging on to RDS get the session-host user policy instead of their normal one.
+
+</details>
+
+<details>
+<summary><b>BitLocker on the client</b></summary>
+
+![manage-bde and key backup](screenshots/build/14-manage-bde-key-backup.jpg)
+`manage-bde -status` shows C: fully encrypted with TPM and recovery password protectors. `Backup-BitLockerKeyProtector` pushes the existing recovery password to AD, which is what you run for a drive that was encrypted before the GPO applied.
+
+</details>
+
+<details>
+<summary><b>SYSVOL replication and trust</b></summary>
+
+![DFSR backlog](screenshots/build/11-dfsr-backlog.jpg)
+`dfsrdiag` isn't on a DC until `RSAT-DFS-Mgmt-Con` is installed. Then the backlog check reports DC02 in sync with DC01.
+
+![Secure channel repair](screenshots/build/19-secure-channel-repair.jpg)
+After the storage incident a server lost its trust relationship. `Test-ComputerSecureChannel` returns False. The first `-Repair` failed, the second returned True, with no unjoin or rejoin.
+
+</details>
+
+<details>
+<summary><b>Time sync</b></summary>
+
+![PDC external source](screenshots/build/16-w32tm-pdc-external-source.jpg)
+DC01 (PDC emulator) set to sync from `time.windows.com` and marked reliable. `w32tm /query /source` confirms it.
+
+![Disabling Hyper-V time sync](screenshots/build/17-disable-vm-time-sync.jpg)
+The first run had a typo (`DC01,DC01`), so DC02 still had Time Synchronization on. The second run turned it off for both.
+
+![DC02 following the domain](screenshots/build/18-w32tm-dc02-domhier.jpg)
+DC02 went from Local CMOS Clock to the Hyper-V provider to `DC01.lab.local` once host time sync was off and `/resync /rediscover` ran.
+
+</details>
+
+<details>
+<summary><b>Certificates and RDS</b></summary>
+
+![Binding the cert to RDS](screenshots/build/25-rds-cert-binding.jpg)
+Exports the CA-issued cert, binds it to RD Web Access, Publishing and Redirector with `Set-RDCertificate`, and sets it on the RDP listener through `Win32_TSGeneralSetting`. The cert store shows `CN=RDS01.lab.local` from the internal CA.
+
+![RD Web Access](screenshots/build/26-rdweb-remoteapps.jpg)
+RD Web loads over HTTPS with no certificate warning and lists the published RemoteApps (Notepad, Paint).
+
+</details>
+
+<details>
+<summary><b>Linux</b></summary>
+
+![Realm join and sudo](screenshots/build/22-linux-realm-join-sudo.jpg)
+`realm discover` finds lab.local, `realm join` adds LNX01, `id user1@lab.local` resolves an AD user with group memberships, and LinuxAdmins gets sudo through `/etc/sudoers.d`.
+
+![Root password reset](screenshots/build/21-linux-root-password-reset.jpg)
+Booted with `init=/bin/bash`, remounted root read-write, reset the password, and touched `/.autorelabel` so SELinux accepts it after reboot.
+
+</details>
+
 ## What I built
 
 **Hyper-V**
