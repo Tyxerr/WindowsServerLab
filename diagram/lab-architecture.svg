@@ -1,0 +1,81 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1000 670" width="1000" height="670" font-family="Segoe UI, Helvetica, Arial, sans-serif">
+  <rect width="1000" height="670" fill="#ffffff"/>
+  <!-- Azure host -->
+  <rect x="20" y="20" width="960" height="630" rx="14" fill="#f3f7fa" stroke="#0f6c8c" stroke-width="2"/>
+  <text x="40" y="52" font-size="20" font-weight="700" fill="#0f2a36">LABHOST</text>
+  <text x="140" y="52" font-size="14" fill="#4a5a66">Azure E8s_v5 · Windows Server 2022 · nested Hyper-V</text>
+  <text x="40" y="74" font-size="13" fill="#4a5a66">C: OS + ISOs · L: lab disks (128 GB) · M: added data disk (256 GB) for live storage migration</text>
+
+  <!-- switch -->
+  <rect x="40" y="96" width="920" height="44" rx="8" fill="#0f6c8c"/>
+  <text x="60" y="124" font-size="16" font-weight="600" fill="#fff">LabNet internal vSwitch · 10.10.10.0/24 · NAT gateway 10.10.10.1 (host) · domain lab.local</text>
+
+  <!-- row 1: DCs -->
+  <g font-size="13">
+    <rect x="40" y="170" width="210" height="110" rx="10" fill="#fff" stroke="#9fb3c0"/>
+    <text x="56" y="196" font-size="16" font-weight="700" fill="#0f2a36">DC01 · .10</text>
+    <text x="56" y="218" fill="#33444f">AD DS · DNS · DHCP (failover)</text>
+    <text x="56" y="238" fill="#33444f">PDC emulator / time source</text>
+    <text x="56" y="258" fill="#33444f">Cluster file share witness</text>
+
+    <rect x="270" y="170" width="210" height="110" rx="10" fill="#fff" stroke="#9fb3c0"/>
+    <text x="286" y="196" font-size="16" font-weight="700" fill="#0f2a36">DC02 · .11</text>
+    <text x="286" y="218" fill="#33444f">AD DS · DNS · DHCP (failover)</text>
+    <text x="286" y="238" fill="#33444f">SYSVOL via DFSR</text>
+    <text x="286" y="258" fill="#33444f">DC03 added, then demoted</text>
+
+    <rect x="500" y="170" width="210" height="110" rx="10" fill="#fff" stroke="#9fb3c0"/>
+    <text x="516" y="196" font-size="16" font-weight="700" fill="#0f2a36">STOR01 · .30</text>
+    <text x="516" y="218" fill="#33444f">iSCSI target: data + quorum</text>
+    <text x="516" y="238" fill="#33444f">AD CS Enterprise Root CA</text>
+    <text x="516" y="258" fill="#33444f">"LAB-CA"</text>
+
+    <rect x="730" y="170" width="230" height="110" rx="10" fill="#fff" stroke="#9fb3c0"/>
+    <text x="746" y="196" font-size="16" font-weight="700" fill="#0f2a36">RDS01 · .60</text>
+    <text x="746" y="218" fill="#33444f">RD Session Host, Broker, Web</text>
+    <text x="746" y="238" fill="#33444f">Cert issued by LAB-CA</text>
+    <text x="746" y="258" fill="#33444f">VDA OU · loopback GPO</text>
+  </g>
+
+  <!-- cluster -->
+  <rect x="40" y="310" width="500" height="170" rx="12" fill="#e6f2f6" stroke="#0f6c8c" stroke-dasharray="6 4"/>
+  <text x="56" y="336" font-size="15" font-weight="700" fill="#0f2a36">Failover cluster FSCLU · .40   ·   clustered file server FSCLUFS · .41</text>
+  <g font-size="13">
+    <rect x="60" y="352" width="210" height="108" rx="10" fill="#fff" stroke="#9fb3c0"/>
+    <text x="76" y="378" font-size="16" font-weight="700" fill="#0f2a36">FS01 · .21</text>
+    <text x="76" y="400" fill="#33444f">Cluster node</text>
+    <text x="76" y="420" fill="#33444f">iSCSI initiator</text>
+    <text x="76" y="440" fill="#33444f">Drain · patch · resume</text>
+
+    <rect x="310" y="352" width="210" height="108" rx="10" fill="#fff" stroke="#9fb3c0"/>
+    <text x="326" y="378" font-size="16" font-weight="700" fill="#0f2a36">FS02 · .22</text>
+    <text x="326" y="400" fill="#33444f">Cluster node</text>
+    <text x="326" y="420" fill="#33444f">iSCSI initiator</text>
+    <text x="326" y="440" fill="#33444f">Trust-repair drill target</text>
+  </g>
+  <!-- iscsi arrows -->
+  <path d="M605 280 L605 300 L290 300 L290 310" fill="none" stroke="#a4481f" stroke-width="2"/>
+  <text x="300" y="294" font-size="12" fill="#a4481f">iSCSI (block storage)</text>
+
+  <!-- clients -->
+  <g font-size="13">
+    <rect x="570" y="352" width="190" height="108" rx="10" fill="#fff" stroke="#9fb3c0"/>
+    <text x="586" y="378" font-size="16" font-weight="700" fill="#0f2a36">CL01 · DHCP</text>
+    <text x="586" y="400" fill="#33444f">Windows 11 Enterprise</text>
+    <text x="586" y="420" fill="#33444f">vTPM · BitLocker</text>
+    <text x="586" y="440" fill="#33444f">GPO test client</text>
+
+    <rect x="780" y="352" width="180" height="108" rx="10" fill="#fff" stroke="#9fb3c0"/>
+    <text x="796" y="378" font-size="16" font-weight="700" fill="#0f2a36">LNX01 · .50</text>
+    <text x="796" y="400" fill="#33444f">Rocky Linux 9</text>
+    <text x="796" y="420" fill="#33444f">fstab recovery</text>
+    <text x="796" y="440" fill="#33444f">VHDX ↔ VMDK test</text>
+  </g>
+
+  <!-- base disk -->
+  <rect x="40" y="505" width="920" height="122" rx="10" fill="#fff" stroke="#9fb3c0"/>
+  <text x="56" y="532" font-size="15" font-weight="700" fill="#0f2a36">Base2022.vhdx (sysprepped, read-only parent)</text>
+  <text x="56" y="556" font-size="13" fill="#33444f">DC01, DC02, FS01, FS02, STOR01 and RDS01 are differencing disks on top of one generalized Server 2022 image.</text>
+  <text x="56" y="578" font-size="13" fill="#33444f">Group Policy: central ADMX store · security baseline + logon banner · DISA STIG test OU</text>
+  <text x="56" y="600" font-size="13" fill="#33444f">proxy / Trusted Sites preferences · enforced "Windows Update off" lab GPO · loopback for session hosts</text>
+</svg>
