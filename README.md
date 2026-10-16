@@ -56,6 +56,10 @@ Domain `lab.local`. Every Windows server runs on a differencing disk off one sys
 
 ![File share witness in use](screenshots/10-cluster-file-share-witness.png)
 
+**Why iSCSI.** A failover cluster needs storage that every node can see, so whichever node owns the file server role can mount the disk and the other can take it over. In an organization that's a SAN (Dell, NetApp, Pure) wired to the Hyper-V or VMware hosts over Fibre Channel or iSCSI. iSCSI carries SCSI disk commands over ordinary Ethernet, so STOR01 plays the SAN here and FS01/FS02 see its disks as local, unformatted drives. In production the same setup gets dedicated storage NICs on their own VLAN, MPIO (two paths so one dead switch doesn't drop the disk) and CHAP authentication. In a home lab, iSCSI is the only free way to practice shared-storage clustering without buying a SAN.
+
+**Why a quorum witness.** Each node gets a vote, and the cluster only runs while more than half the votes are online. With two nodes, losing one leaves 1 of 2, which isn't a majority, so the witness is the third vote that breaks the tie. Its real job is preventing split-brain: if the nodes lose sight of each other, only the side that holds the witness keeps running, so both nodes never write to the same disk at once and corrupt it. I tried both a disk witness (a small iSCSI LUN) and a file share witness. Picking the witness type matters on a disconnected network: Azure cloud witness is the default suggestion in newer builds and won't work with no internet, so it's a file share or disk witness there. The witness also shouldn't live on a VM that runs on the same cluster it's protecting.
+
 **Remote access and PKI**
 - RDS session deployment on RDS01
 - Enterprise Root CA on STOR01, Web Server certificates issued to RDS (details below)
@@ -101,6 +105,32 @@ Two commands make this quick to diagnose:
 - **`nltest /dsgetdc:lab.local`** shows which DC the machine is actually talking to and whether it can find one at all. It's the first check for any "can't log in / GPO won't apply" ticket, because it separates "can't find a DC" (DNS, network, site config) from "found a DC but it's rejecting me".
 - **`Test-ComputerSecureChannel`** returns True or False for the trust itself. Running it with `-Server DC01` and `-Server DC02` shows whether the DCs disagree, which points to replication lag rather than a truly broken account. `-Repair -Credential` resets the password with a DC and fixes it without unjoining and rejoining, so the machine keeps its SID, group memberships and GPO scope.
 
+## When DC01 goes down
+
+DC01 was the first DC in the forest, so it holds all five FSMO roles. **FSMO roles do not fail over on their own.** DC02 keeps the domain running, but it does not take the roles unless someone moves them.
+
+What keeps working with only DC02 up: logons and Kerberos, LDAP, AD-integrated DNS (as long as clients list DC02 as a DNS server), global catalog lookups, and DHCP through the failover partnership.
+
+What degrades, by role:
+
+| Role | Impact while DC01 is down |
+|---|---|
+| PDC emulator | No authoritative time source, so clock skew creeps in over days. Password changes and lockouts no longer funnel to one DC. GPMC edits GPOs on the PDC by default and warns. |
+| RID master | DC02 keeps creating users and computers until its current RID pool (500 IDs) runs out, then new accounts fail. |
+| Infrastructure master | No impact when every DC is a global catalog, as here. |
+| Schema master, Domain naming master | Only needed for schema extensions and adding or removing domains. |
+
+DC01 also hosts the cluster's file share witness, so the cluster drops to 2 of 3 votes. It stays up, but now the next node failure decides whether the cluster survives.
+
+**What I'd do:**
+- **Down for a reboot or a few hours**: nothing. Let it come back.
+- **Planned replacement**: transfer the roles while both DCs are up. Then point the PDC time configuration at DC02 and move the witness.
+  ```powershell
+  Move-ADDirectoryServerOperationMasterRole -Identity DC02 -OperationMasterRole PDCEmulator,RIDMaster,InfrastructureMaster,SchemaMaster,DomainNamingMaster
+  ```
+- **DC01 is dead and not coming back**: seize the roles on DC02 with the same command plus `-Force`. Then run metadata cleanup: delete DC01's computer object in ADUC or its server object in Sites and Services, and remove its DNS records. A DC whose roles were seized must never come back online as-is; it gets wiped and rebuilt. Otherwise two DCs claim the same roles, and with the RID master that can mean duplicate SIDs.
+- Afterward, run `netdom query fsmo`, `dcdiag /q` and `repadmin /replsummary`, and check `w32tm /query /source` on DC02.
+
 ## Certificates for RDS
 
 Edge refused the RD Web page with `ERR_SSL_KEY_USAGE_INCOMPATIBLE`. The certificate RDS generates for itself doesn't include the digital signature key usage that current browsers require. The fix was a proper certificate from an internal CA:
@@ -122,7 +152,7 @@ A Windows 11 VM failed to restore from saved state: "Microsoft Virtual TPM Devic
 
 ## Restore runbook: SYSVOL and the AD database
 
-"Restore" means two different things in AD, so the first question is which one.
+I was asked about authoritative restores in a previous interview, so I built this section out on purpose. "Restore" means two different things in AD, so the first question is which one.
 
 **SYSVOL (DFSR)**
 - **Non-authoritative**: one DC's SYSVOL is bad; it throws its copy away and pulls a fresh one from a partner. In ADSI Edit, on that DC's `CN=SYSVOL Subscription` object set `msDFSR-Enabled = FALSE`, replicate, `dfsrdiag pollad`, wait for event **4114**. Set it back to TRUE, replicate, `pollad`, and look for **4614** then **4604**. I ran this on DC02.
@@ -176,6 +206,7 @@ Get-RDCertificate -ConnectionBroker rds01.lab.local
 - **Vulnerability scanning with Nessus** (Nessus Essentials covers a lab this size) against the servers, then remediate and rescan
 - **DISA STIG compliance scanning with SCAP**: run the SCAP Compliance Checker against the STIG benchmarks, review results in STIG Viewer, and compare before and after applying the STIG GPOs
 - **WSUS** with approval rings, replacing the "updates off" lab policy
+- **Moving to a physical server at home.** A used rack server (PowerEdge or ProLiant class) running Hyper-V, hosting real workloads instead of only lab VMs: trade-copier software for my futures accounts, and always-on browser-based AI agents for search and automation that use my own data. Since that data is personal, the build plan is security first: its own VLAN, no inbound ports (remote access only over a WireGuard or Tailscale VPN), secrets in a vault instead of config files, encrypted disks, least-privilege service accounts, and tested backups. It also gives me iDRAC/iLO, RAID and hardware-failure experience that a cloud VM can't.
 - **Lower-cost stand-ins for expensive platforms.** Citrix licensing makes it hard to lab, so RDS with RemoteApp covers the same concepts (session hosts, published apps, profiles, loopback policy). The tradeoff is that RDS lacks Citrix's HDX protocol tuning, PVS/MCS image management and Director's helpdesk view. Other free options I'm weighing: Veeam Backup & Replication Community Edition for backup and restore drills, Windows Admin Center for management, and VMware's evaluation licenses for vSphere side-by-side comparison.
 
 ## Terms
@@ -185,7 +216,15 @@ Get-RDCertificate -ConnectionBroker rds01.lab.local
 | FSMO | Flexible Single Master Operations: five roles only one DC holds at a time. The PDC emulator is the time source and handles password changes and lockouts. |
 | Secure channel | The trust between a domain member and AD, based on the computer account password |
 | Paused-Critical | Hyper-V paused a VM because its storage can't take writes |
-| Quorum witness | Tie-breaker vote that keeps a split cluster from running on both halves |
+| Transfer vs seize | Transfer moves a FSMO role while both DCs are up. Seize forces it when the holder is gone for good, and the old holder must never return. |
+| RID pool | Block of 500 relative IDs a DC uses to build SIDs for new objects, handed out by the RID master |
+| iSCSI | SCSI disk commands carried over Ethernet. The target (STOR01) serves the disk; the initiator (FS01, FS02) mounts it like a local drive. |
+| LUN | Logical Unit Number: one disk presented by a SAN or iSCSI target |
+| MPIO | Multipath I/O: two network paths to the same storage so one failure doesn't drop the disk |
+| Quorum | The cluster runs only while more than half of the votes (nodes plus witness) are online |
+| Quorum witness | Tie-breaker vote that keeps a split cluster from running on both halves (disk, file share or cloud witness) |
+| Split-brain | Both halves of a cluster think they own the storage and write to it, corrupting it. Quorum exists to prevent this. |
+| DSRM | Directory Services Restore Mode: boots a DC with AD offline for database restores |
 | CNO | Cluster Name Object, the cluster's computer account in AD |
 | SAN vs NAS | SAN presents a disk the server formats (iSCSI, Fibre Channel); NAS presents a share (SMB, NFS) |
 | Key Usage | Certificate field listing what the key may do; browsers need digital signature for TLS |
