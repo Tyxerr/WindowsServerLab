@@ -1,241 +1,198 @@
-# Windows Server 2022 Lab: AD, Group Policy, Hyper-V Clustering, RDS and PKI
+# Windows Server Lab
 
-A one-week build of a small enterprise Windows environment on nested Hyper-V in Azure: two domain controllers, a two-node failover cluster on iSCSI storage, an internal certificate authority, Remote Desktop Services, a Windows 11 client and a Rocky Linux server.
+Windows Server 2022 environment built on nested Hyper-V in Azure: Active Directory, Group Policy, a two-node failover cluster on iSCSI storage, an internal certificate authority, Remote Desktop Services, a Windows 11 client and a Rocky Linux server joined to the domain.
 
-The build was the easy part. Most of what I learned came from things breaking, so this write-up is mostly about those: what I saw, what caused it, how I fixed it, and what I'd do differently.
+I built it to get hands-on with the infrastructure I want to run day to day. The parts I cared most about were clustering and shared storage. Most production Windows workloads sit on Hyper-V clusters backed by a SAN, and the hard parts of that job are keeping VMs up while hosts get patched, understanding why a cluster loses quorum, and knowing how block storage behaves when a node drops. iSCSI let me build that same pattern with nothing but VMs.
+
+This is a living project. I'm adding to it (see [Roadmap](#roadmap)).
 
 ![Lab architecture](diagram/lab-architecture.png)
-
----
-
-## Contents
-
-- [Environment](#environment)
-- [What I built](#what-i-built)
-- [What broke and how I fixed it](#what-broke-and-how-i-fixed-it)
-- [Commands I'll keep using](#commands-ill-keep-using)
-- [Terms I learned](#terms-i-learned)
-- [What I'd do differently](#what-id-do-differently)
-
----
 
 ## Environment
 
 | VM | IP | Role |
 |---|---|---|
-| **LABHOST** | Azure | Azure E8s_v5 VM running Windows Server 2022 with nested Hyper-V. Internal vSwitch + NAT. |
-| **DC01** | 10.10.10.10 | Domain controller, DNS, DHCP (failover pair), PDC emulator / time source, cluster file share witness |
-| **DC02** | 10.10.10.11 | Domain controller, DNS, DHCP (failover pair) |
-| **STOR01** | 10.10.10.30 | iSCSI target (data + quorum disks), AD CS Enterprise Root CA |
-| **FS01 / FS02** | .21 / .22 | Failover cluster nodes (cluster FSCLU .40, clustered file server FSCLUFS .41) |
-| **RDS01** | 10.10.10.60 | RD Session Host, Connection Broker, RD Web Access |
-| **CL01** | DHCP | Windows 11 Enterprise client with a virtual TPM |
-| **LNX01** | 10.10.10.50 | Rocky Linux 9 |
+| LABHOST | Azure | E8s_v5, Windows Server 2022, nested Hyper-V, internal vSwitch with NAT |
+| DC01 | 10.10.10.10 | Domain controller, DNS, DHCP failover partner, PDC emulator and time source, cluster file share witness |
+| DC02 | 10.10.10.11 | Domain controller, DNS, DHCP failover partner |
+| STOR01 | 10.10.10.30 | iSCSI target (data and quorum disks), Enterprise Root CA |
+| FS01, FS02 | .21, .22 | Failover cluster nodes. Cluster FSCLU (.40), clustered file server FSCLUFS (.41) |
+| RDS01 | 10.10.10.60 | RD Session Host, Connection Broker, RD Web Access |
+| CL01 | DHCP | Windows 11 Enterprise with a virtual TPM |
+| LNX01 | 10.10.10.50 | Rocky Linux 9, joined to the domain |
 
-Domain: `lab.local`. Every Windows server is a differencing disk on one sysprepped, read-only Server 2022 base image.
+Domain `lab.local`. Every Windows server runs on a differencing disk off one sysprepped, read-only Server 2022 base image.
 
 ![Hyper-V Manager and host volumes](screenshots/01-hyperv-vms-and-host-disk.png)
 
----
-
 ## What I built
 
-**Hyper-V and the host**
-- Nested virtualization on an Azure VM (Standard security type, since Trusted Launch blocks nested Hyper-V)
-- Internal vSwitch with NAT so the lab's DHCP can't leak onto any real network
-- Sysprepped base image + differencing disks, Gen 2 VMs, virtual TPM for Windows 11, Secure Boot template for Linux
-- Checkpoints, live storage migration (`Move-VMStorage`), VHDX compaction, VHDX → VMDK conversion with qemu-img
+**Hyper-V**
+- Nested virtualization on an Azure VM, internal vSwitch with NAT so lab DHCP stays isolated
+- Sysprepped base image with differencing disks, Gen 2 VMs, virtual TPM, Linux Secure Boot template
+- Checkpoints, live storage migration with `Move-VMStorage`, VHDX compaction with `Optimize-VHD`
+- VMware to Hyper-V disk conversion: converted a VHDX to VMDK and back with **qemu-img**, then built a VM from the converted disk. In production I'd reach for StarWind V2V Converter or a Veeam restore straight to Hyper-V, and plan for the post-conversion work: remove VMware Tools, match Gen 1 vs Gen 2 to the source firmware (BIOS VMs become Gen 1), re-IP the NIC, check activation.
 
-**Active Directory, DNS, DHCP**
-- New forest, second DC, FSMO transfer, reverse zone, SRV record checks, scavenging
-- DHCP failover between both DCs
-- OU structure (Users, Workstations, Servers, Groups, VDA) and bulk user creation from CSV
-- Replaced a DC: promoted DC03, moved the FSMO roles, demoted it
-- AD-integrated time hierarchy: PDC emulator as the source, Hyper-V time sync turned off for DCs
+**Active Directory**
+- New forest, second DC, DNS reverse zone and SRV record checks, scavenging, DHCP failover across both DCs
+- **FSMO (Flexible Single Master Operations)** roles: transferred between DCs, and know when to seize instead
+- DC replacement: promoted DC03, moved the FSMO roles, demoted it, checked functional level
+- OU design (Users, Workstations, Servers, Groups, VDA) and bulk user creation from CSV
+- AD Recycle Bin, fine-grained password policy, BitLocker recovery keys escrowed to AD
 
 **Group Policy**
-- Central ADMX store, security baseline with logon banner, remote-update firewall rules
-- Pushed GPOs three ways (`gpupdate`, `Invoke-GPUpdate`, GPMC by OU) and proved them with `gpresult`
-- Broke it on purpose and fixed it: wrong OU link, security filtering without Authenticated Users read, WMI filter, loopback, client DNS, clock skew, SYSVOL replication, group membership needing a new logon
-- Group Policy Preferences for proxy bypass / Trusted Sites
-- DISA STIG GPO backups imported into a test OU
-- Enforced domain-level GPO to stop Windows Update in the lab (see incident 1)
+- Central ADMX store, security baseline with logon banner, firewall rules for remote GP refresh
+- Pushed policy three ways (`gpupdate`, `Invoke-GPUpdate`, GPMC by OU) and verified with `gpresult`
+- Troubleshot the common failures on purpose: wrong OU link, security filtering without Authenticated Users read, WMI filters, loopback processing, client DNS, clock skew, SYSVOL replication, group membership needing a new logon
+- Group Policy Preferences for proxy bypass and Trusted Sites
+- DISA STIG GPO backups imported into a test OU before wider rollout
+
+![Group Policy Preferences registry item for proxy settings](screenshots/02-gpp-proxy-exception.png)
 
 **Clustering and storage**
-- iSCSI target on STOR01, initiators on FS01/FS02
-- `Test-Cluster` validation, two-node cluster, disk witness then file share witness
-- Clustered file server role and planned/unplanned failover
+- iSCSI target on STOR01, initiators on both nodes, `Test-Cluster` validation
+- Two-node cluster, disk witness and then a file share witness on DC01 (granted to the cluster's computer account, FSCLU$)
+- Clustered file server role, planned and unplanned failover, drain / patch / resume of a node
+
+![File share witness in use](screenshots/10-cluster-file-share-witness.png)
 
 **Remote access and PKI**
-- RDS quick deployment on RDS01 (session host, broker, web access)
-- Enterprise Root CA on STOR01, certificate templates, enrollment permissions, cert bound to the RDS roles
+- RDS session deployment on RDS01
+- Enterprise Root CA on STOR01, Web Server certificates issued to RDS (details below)
 
 **Linux**
-- Rocky Linux 9 on Hyper-V, `/etc/fstab` recovery from emergency mode, rebuild when locked out
+- Rocky Linux 9 joined to AD with realmd and SSSD, domain logins, sudo granted through an AD group
 
----
+```bash
+dnf install -y realmd sssd oddjob oddjob-mkhomedir adcli samba-common-tools krb5-workstation
+realm discover lab.local
+realm join lab.local -U Administrator
+id user1@lab.local
+realm permit -g LinuxAdmins@lab.local
+echo '%linuxadmins@lab.local ALL=(ALL) ALL' > /etc/sudoers.d/linuxadmins
+```
 
-## What broke and how I fixed it
+## Incident: host storage ran out and took the domain with it
 
-### 1. Host disk filled up and took the domain down with it
+**What happened.** The host volume holding the VM disks filled up. Hyper-V put the affected VMs, including both domain controllers, into **Paused-Critical** ("disks encountered critical IO errors"). From there it cascaded: clients couldn't reach a DC, Group Policy failed with "lack of network connectivity to a domain controller", cluster validation failed with "RPC server unavailable", and one server lost its trust relationship after rotating its machine password with one DC while the other was paused.
 
-This one chained through five layers before I found the cause.
+**Root cause.** The VMs reached the internet through NAT and were downloading and installing Windows Updates. The dynamic disks grew fast: one file server went from 7 GB to 22 GB in an afternoon, and DC01 from 16 GB to 38 GB.
 
-| Symptom | What was actually happening |
-|---|---|
-| VMs showing **Paused-Critical**, later both DCs: "Disk(s) encountered critical IO errors" | The L: volume on the host hit 0 bytes free. Dynamic VHDX files can't grow, so Hyper-V pauses the VM to protect it. |
-| Member servers on the **Private** firewall profile | With the DCs paused, Network Location Awareness couldn't find a DC, so the profile dropped from DomainAuthenticated to Private. |
-| `Test-Cluster`: "Unable to connect via WMI. The RPC server is unavailable." | The Private profile blocks RPC/WMI from other machines. |
-| `gpupdate`: "failed because of lack of network connectivity to a domain controller" | Same root cause: no reachable DC. |
-| FS02: "The trust relationship between this workstation and the primary domain failed" | FS02 rotated its machine password with one DC while the other was paused, before replication caught up. |
+**Fix.**
+1. Attached a 256 GB Azure data disk and moved the busiest VMs onto it with `Move-VMStorage` while they ran.
+2. Resumed the paused VMs, then **restarted both domain controllers cleanly**. After being paused mid-write, AD Web Services stopped answering and the DCs weren't serving clients reliably until they came back up fresh. After the restart I checked the DFS Replication log for event 2213 (dirty shutdown, which pauses SYSVOL replication until resumed by hand) and forced replication with `repadmin /syncall /AdeP`.
+3. **Disabled Windows Update in the lab**: an enforced GPO at the domain root (Configure Automatic Updates = Disabled), and the `wuauserv` service set to Disabled. Enforced so no OU-level update policy could override it.
+4. Reclaimed space offline: shut each VM down, mounted its VHDX on the host, cleared the update caches, compacted the disk with `Optimize-VHD`, and started it again.
+5. Repaired the broken secure channel (next section).
 
-**Root cause:** the VMs were pulling Windows Updates through the NAT and the dynamic disks ballooned (FS02 went from 7 GB to 22 GB in an afternoon; DC01 from 16 GB to 38 GB).
-
-**Fix:**
-1. Added a 256 GB Azure data disk (attaches live) and moved the busiest VMs to it with `Move-VMStorage` while they ran.
-2. Resumed the paused VMs, then checked DFSR for event 2213 (dirty shutdown) on the DCs.
-3. Wrote a script that shuts each VM down cleanly, mounts its VHDX on the host, deletes the update caches from outside the guest, compacts the disk with `Optimize-VHD`, and starts it again. Stopping `wuauserv` inside a guest mid-install just hangs.
-4. Linked a "Windows Update off" GPO at the domain root with **Enforced**, so OU-linked WSUS GPOs can't override it.
-5. Restarted the NIC on the DCs and members so they re-detected the domain network, repaired FS02's secure channel, and forced replication.
-
-**Lesson:** check the basics first. A full disk showed up as a firewall problem, a Group Policy problem, a cluster problem and a trust problem.
+**How updates should be served instead.** Clients shouldn't pull from the internet on their own. On an internal or disconnected network the standard is **WSUS** (or MECM with WSUS as its software update point): one server syncs updates, admins approve them, and clients get them by GPO in rings (test, production servers, DCs one at a time, clusters node by node). On a fully disconnected network, WSUS syncs on a connected system and the content is exported and imported across. Microsoft has stopped adding features to WSUS but it is still supported and shipped. Internet-connected fleets are moving to Windows Update for Business, Autopatch or Azure Update Manager.
 
 ![VMs paused critical](screenshots/05-vms-paused-critical.png)
 ![DCs with critical IO errors](screenshots/06-dcs-critical-io-errors.png)
-![Private profile](screenshots/07-private-firewall-profile.png)
-![Group Policy can't reach a DC](screenshots/08-gp-no-dc-connectivity.png)
-![L: full, M: added](screenshots/09-L-full-M-added.png)
+![Group Policy unable to reach a DC](screenshots/08-gp-no-dc-connectivity.png)
+![Host volume full, new data disk added](screenshots/09-L-full-M-added.png)
 
-### 2. Broken trust relationship
+## Trust relationships: `nltest` and `Test-ComputerSecureChannel`
 
-**Symptom:** domain logons on FS02 failed with the trust relationship error.
-**Cause:** FS02's machine account password no longer matched what AD had. I caused it on purpose once by restoring an old checkpoint; it also happened for real after the DC outage above.
-**Fix:** signed in with the local admin (or used PowerShell Direct from the host), ran `Test-ComputerSecureChannel -Server DC01` and `-Server DC02` to see which DC disagreed, then `Test-ComputerSecureChannel -Repair -Credential LAB\Administrator`, then `repadmin /syncall /AdeP`.
-**Side lesson:** `Remove-ADComputer` fails with "can perform the requested operation only on a leaf object" when the computer object has child objects; `Remove-ADObject -Recursive` handles it.
+Every domain member has a computer account with a password that the machine rotates on its own. If the machine and AD disagree on that password, the secure channel breaks and domain logons fail with "the trust relationship between this workstation and the primary domain failed."
 
-### 3. SYSVOL non-authoritative restore and time source
+Two commands make this quick to diagnose:
 
-Practiced a non-authoritative SYSVOL resync on DC02: set `msDFSR-Enabled` to FALSE in ADSI Edit, replicated, confirmed event 4114, re-enabled, confirmed 4614/4604. Same session, `w32tm /query /source` showed **Local CMOS Clock** on a DC, which means it wasn't syncing from anything. Fixed with `w32tm /config /syncfromflags:domhier /update` and turned off Hyper-V time sync for the DCs.
+- **`nltest /dsgetdc:lab.local`** shows which DC the machine is actually talking to and whether it can find one at all. It's the first check for any "can't log in / GPO won't apply" ticket, because it separates "can't find a DC" (DNS, network, site config) from "found a DC but it's rejecting me".
+- **`Test-ComputerSecureChannel`** returns True or False for the trust itself. Running it with `-Server DC01` and `-Server DC02` shows whether the DCs disagree, which points to replication lag rather than a truly broken account. `-Repair -Credential` resets the password with a DC and fixes it without unjoining and rejoining, so the machine keeps its SID, group memberships and GPO scope.
 
-![DFSR events and time source](screenshots/03-sysvol-dfsr-nonauth-restore.png)
+## Certificates for RDS
 
-### 4. DC demote blocked by my own password policy
+Edge refused the RD Web page with `ERR_SSL_KEY_USAGE_INCOMPATIBLE`. The certificate RDS generates for itself doesn't include the digital signature key usage that current browsers require. The fix was a proper certificate from an internal CA:
 
-`Uninstall-ADDSDomainController` failed because the new local administrator password didn't meet the 14-character minimum I had set in the domain password policy earlier in the week. It made sense once I read it: the demoted server falls back to local accounts, and the policy still applies.
+- Deployed an **Enterprise Root CA** on STOR01. An Enterprise CA registers itself in AD's configuration partition, so the install has to run as Enterprise Admin.
+- Issued a **Web Server** certificate for `rds01.lab.local`. A request into the computer's certificate store enrolls as the computer account, so the template needs Read and Enroll for that computer or group.
+- RDS needs the private key to be **exportable** because the broker distributes the certificate to the other role servers. The built-in Web Server template is a version 1 template that can't be edited, so the right move is to duplicate it with "Allow private key to be exported" and publish the copy with `Add-CATemplate`.
+- Bound the certificate to RD Web Access, Publishing and Redirector with `Set-RDCertificate`, and verified it with `Get-RDCertificate` (Level: Trusted). Domain clients trust the CA automatically because its root is published in AD.
 
-![Demote blocked by password policy](screenshots/04-dc-demote-password-policy.png)
+![Enterprise CA installed](screenshots/14-ca-install-as-domain-admin.png)
+![Web Server certificate issued](screenshots/18-web-server-cert-issued.png)
+![RD Web Access](screenshots/17-rdweb-working.png)
 
-### 5. Clustering: four separate blockers
+## Recovering a VM with a virtual TPM
 
-| Error | Cause | Fix |
-|---|---|---|
-| `Test-Cluster`: Access is denied | Signed in as the local Administrator, which has no rights on the other node or in AD | Signed in as the domain admin |
-| Unable to connect via WMI / RPC unavailable | FS02 on the Private firewall profile and still on DHCP | Static IP, DNS pointed at the DCs, NIC restart to re-detect the domain |
-| "File Services could not be found on any node" | `FS-FileServer` wasn't installed on the nodes | `Install-WindowsFeature FS-FileServer` on both nodes |
-| File share witness | The cluster writes to the witness as its own computer account (FSCLU$) | Granted FSCLU$ on both the share and NTFS; the cluster created its GUID folder in the share |
-
-![Witness folder and file server role](screenshots/10-cluster-witness-and-fs-role.png)
-
-### 6. RDS and an internal CA: one error at a time
-
-| Error | Cause | Fix |
-|---|---|---|
-| `ERR_SSL_KEY_USAGE_INCOMPATIBLE` on RD Web | The cert RDS generated for itself didn't allow digital signature, and current browsers require it | Issue a proper Web Server cert from an internal CA |
-| CA install: `ERROR_DS_RANGE_CONSTRAINT` | Installed as the local admin. An Enterprise CA writes to AD's configuration partition, which needs Enterprise Admins. | Re-ran as the domain admin |
-| "The requested certificate template is not supported by this CA" | The template wasn't published on the CA | Published it with `Add-CATemplate`, replicated |
-| "You do not have permission to request this type of certificate" | A LocalMachine request enrolls as the **computer** account, not the user | Gave the computer account Read + Enroll on the template |
-| "Cannot export non-exportable private key" | The built-in Web Server template is a v1 template with a locked key, and RDS wants an exportable one | Duplicated the template with "Allow private key to be exported" |
-
-Also learned not to trust a command that returns nothing: `Set-RDCertificate -Thumbprint` returned no error, but `Get-RDCertificate` still showed every role as NotConfigured.
-
-![Key usage error](screenshots/12-rdweb-key-usage-error.png)
-![CA install as local admin](screenshots/13-ca-install-as-local-admin.png)
-![CA install as domain admin](screenshots/14-ca-install-as-domain-admin.png)
-![Enrollment denied](screenshots/15-template-enroll-denied.png)
-![Non-exportable key](screenshots/16-non-exportable-key.png)
-![RD Web Access working](screenshots/17-rdweb-working.png)
-
-### 7. Windows 11 VM wouldn't restore from saved state
-
-**Error:** "Microsoft Virtual TPM Device ... Failed to restore with Error 'The computed authentication tag did not match the input authentication tag.'"
-**Cause:** the saved state, which includes the vTPM's encrypted data, was damaged when the host volume filled.
-**Fix path:** `Remove-VMSavedState` and cold boot. If the vTPM itself can't be unlocked: reset it (`Disable-VMTPM`, new key protector, `Enable-VMTPM`), get the BitLocker recovery password from AD (`msFVE-RecoveryInformation` under the computer object), then reseal BitLocker to the new TPM with `manage-bde -protectors -add C: -tpm`.
+A Windows 11 VM failed to restore from saved state: "Microsoft Virtual TPM Device ... the computed authentication tag did not match." The saved state includes the vTPM's encrypted data and was damaged when the host volume filled. Recovery order: discard the saved state (`Remove-VMSavedState`) and cold boot. If the vTPM itself can't be unlocked, replace it (new key protector, `Enable-VMTPM`), pull the BitLocker recovery password from AD (the `msFVE-RecoveryInformation` object under the computer account), then reseal BitLocker to the new TPM with `manage-bde -protectors -add C: -tpm`.
 
 ![vTPM restore failure](screenshots/11-vtpm-saved-state-failure.png)
 
-### 8. Smaller ones worth remembering
+## Restore runbook: SYSVOL and the AD database
 
-- **STIG GPO import:** `Import-GPO -Path` wants the folder that *contains* the `{GUID}` backup folders, not the GUID folder itself. Reading each `bkupInfo.xml` gives the GPO name and backup ID.
-- **"Not recognized as a cmdlet" on a command I knew was right:** hidden characters from pasting. Retyping it fixed it.
-- **A typo PowerShell doesn't flag:** `$r.Certficate.Thumbprint` returns nothing instead of an error. Tab completion prevents it.
-- **qemu-img `SetEndOfFile error 112`:** Windows error 112 is "not enough space on the disk". Same root cause as incident 1.
-- **`New-VM` disk-full error with the VHD on another drive:** the VM's config files still go to the default path unless you pass `-Path`.
+"Restore" means two different things in AD, so the first question is which one.
 
-![GPP proxy exception](screenshots/02-gpp-proxy-exception.png)
+**SYSVOL (DFSR)**
+- **Non-authoritative**: one DC's SYSVOL is bad; it throws its copy away and pulls a fresh one from a partner. In ADSI Edit, on that DC's `CN=SYSVOL Subscription` object set `msDFSR-Enabled = FALSE`, replicate, `dfsrdiag pollad`, wait for event **4114**. Set it back to TRUE, replicate, `pollad`, and look for **4614** then **4604**. I ran this on DC02.
+- **Authoritative**: SYSVOL is bad everywhere, or every DC needs to roll back to one good copy. Stop DFSR on all DCs. On the good DC set `msDFSR-Enabled = FALSE` and `msDFSR-Options = 1`; on the rest set `msDFSR-Enabled = FALSE`. Replicate, start DFSR on the good DC (4114), set it to TRUE and `pollad` (**4602**). Then start DFSR on the others (4114), set them TRUE and `pollad` (4614, 4604). Anything changed only on the other DCs is lost, so it's the last resort.
 
----
+![DFSR events during the non-authoritative resync](screenshots/03-sysvol-dfsr-nonauth-restore.png)
 
-## Commands I'll keep using
+**AD database**
+- **Recycle Bin first**: with it enabled, a deleted user or OU comes back with its attributes and group memberships through `Restore-ADObject`. No downtime.
+- **Non-authoritative**: boot the DC into Directory Services Restore Mode, restore system state (`wbadmin start systemstaterecovery`), reboot. Replication brings it current, which also means it re-deletes anything you hoped to recover.
+- **Authoritative**: after the system state restore and before rebooting, `ntdsutil` › `activate instance ntds` › `authoritative restore` › `restore subtree "OU=..."`. That raises the version numbers so the restored objects win replication. Then import the generated LDIF file to restore back-links such as group memberships.
+
+## Time sync for virtual DCs
+
+Hyper-V's time sync fights domain time on a virtual DC, so it's off for the DCs and the PDC emulator is the only machine that talks to an outside source:
 
 ```powershell
-# Replication and Group Policy
-repadmin /syncall /AdeP                      # push AD changes to every DC now
-repadmin /replsummary                        # replication health at a glance
-Invoke-GPUpdate -Computer CL01 -Force -RandomDelayInMinutes 0   # remote gpupdate, no 10-minute random delay
-gpresult /r /scope computer                  # which GPOs applied, and from which OU
-klist -li 0x3e7 purge                        # clear the computer's Kerberos tickets before a refresh
+# On the Hyper-V host
+Disable-VMIntegrationService -VMName DC01,DC02 -Name "Time Synchronization"
 
-# Trust, time, DC location
-Test-ComputerSecureChannel -Repair -Credential LAB\Administrator
-nltest /dsgetdc:lab.local
-w32tm /query /source
+# On the PDC emulator (DC01): sync from an external or internal NTP source
+w32tm /config /manualpeerlist:"time.windows.com,0x8" /syncfromflags:manual /reliable:yes /update
+Restart-Service w32time; w32tm /resync /rediscover
 
-# Network location (domain vs private profile)
-Get-NetConnectionProfile
-Restart-NetAdapter -Name Ethernet
+# On every other DC and member: follow the domain hierarchy
+w32tm /config /syncfromflags:domhier /update
+w32tm /query /source        # should name a DC, never "Local CMOS Clock" or the VM IC provider
+```
 
-# Hyper-V
+On a network with no internet, the PDC's peer is an internal NTP server or GPS-disciplined clock instead.
+
+## Commands worth knowing
+
+```powershell
+repadmin /replsummary                       # replication health across all DCs
+repadmin /syncall /AdeP                     # push changes everywhere now (All partitions, DNs, Enterprise, Push)
+dcdiag /q                                   # DC health, failures only
+nltest /dsgetdc:lab.local                   # which DC this machine is using
+Test-ComputerSecureChannel -Server DC02     # trust check against a specific DC
+Invoke-GPUpdate -Computer CL01 -Force -RandomDelayInMinutes 0   # remote refresh without the default random delay
+gpresult /r /scope computer                 # applied GPOs and the computer's OU
+netdom query fsmo                           # FSMO role holders
 Get-VM | ? State -like 'Paused*' | Resume-VM
 Move-VMStorage -VMName FS02 -DestinationStoragePath M:\Lab\FS02
-Invoke-Command -VMName FS02 -Credential LAB\Administrator { ... }   # PowerShell Direct, works with no network
-
-# Certificates and RDS
-certutil -ADCA
-Add-CATemplate -Name WebServer -Force
+Invoke-Command -VMName DC01 -Credential LAB\Administrator { ... }   # PowerShell Direct, no network needed
 Get-RDCertificate -ConnectionBroker rds01.lab.local
 ```
 
----
+## Roadmap
 
-## Terms I learned
+- **Vulnerability scanning with Nessus** (Nessus Essentials covers a lab this size) against the servers, then remediate and rescan
+- **DISA STIG compliance scanning with SCAP**: run the SCAP Compliance Checker against the STIG benchmarks, review results in STIG Viewer, and compare before and after applying the STIG GPOs
+- **WSUS** with approval rings, replacing the "updates off" lab policy
+- **Lower-cost stand-ins for expensive platforms.** Citrix licensing makes it hard to lab, so RDS with RemoteApp covers the same concepts (session hosts, published apps, profiles, loopback policy). The tradeoff is that RDS lacks Citrix's HDX protocol tuning, PVS/MCS image management and Director's helpdesk view. Other free options I'm weighing: Veeam Backup & Replication Community Edition for backup and restore drills, Windows Admin Center for management, and VMware's evaluation licenses for vSphere side-by-side comparison.
 
-| Term | What it means |
+## Terms
+
+| Term | Meaning |
 |---|---|
-| **Paused-Critical** | Hyper-V paused a VM because its storage can't take writes, usually a full host volume |
-| **Network Location Awareness (NLA)** | The Windows service that decides whether a NIC is on a Domain, Private or Public network, which decides the firewall profile |
-| **Secure channel** | The trust between a domain member and AD, based on the computer account's password |
-| **FSMO roles** | Five single-holder AD roles; the PDC emulator is the time source and handles password changes and lockouts |
-| **Non-authoritative restore** | One DC throws away its copy and pulls a fresh one from a partner (DFSR events 4114 → 4614 → 4604) |
-| **Quorum / witness** | The tie-breaker vote that stops a split cluster from running on both halves |
-| **CNO** | Cluster Name Object, the cluster's computer account in AD (FSCLU$) |
-| **SAN vs NAS** | SAN presents a disk (iSCSI, Fibre Channel) that the server formats; NAS presents a share (SMB, NFS) |
-| **Key Usage** | The certificate field that lists what the key is allowed to do; browsers require digital signature for TLS |
-| **Template publishing** | A CA only issues templates that are on its list (`Add-CATemplate`) |
-| **v1 template** | Built-in templates like Web Server whose settings can't be edited, only duplicated |
-| **Enforced GPO link** | A link that can't be overridden by GPOs linked lower down (LSDOU: Local, Site, Domain, OU) |
-| **PowerShell Direct** | Running commands in a VM through Hyper-V itself, no network needed |
-| **Differencing disk** | A child VHDX that stores only changes from a read-only parent |
+| FSMO | Flexible Single Master Operations: five roles only one DC holds at a time. The PDC emulator is the time source and handles password changes and lockouts. |
+| Secure channel | The trust between a domain member and AD, based on the computer account password |
+| Paused-Critical | Hyper-V paused a VM because its storage can't take writes |
+| Quorum witness | Tie-breaker vote that keeps a split cluster from running on both halves |
+| CNO | Cluster Name Object, the cluster's computer account in AD |
+| SAN vs NAS | SAN presents a disk the server formats (iSCSI, Fibre Channel); NAS presents a share (SMB, NFS) |
+| Key Usage | Certificate field listing what the key may do; browsers need digital signature for TLS |
+| Enforced GPO link | A link that lower GPOs can't override (processing order: Local, Site, Domain, OU) |
+| Differencing disk | A child VHDX that stores only changes from a read-only parent |
+| PowerShell Direct | Running commands inside a VM through Hyper-V itself, no network required |
 
 ---
 
-## What I'd do differently
-
-1. **Size storage for growth, and alert on it.** Dynamic disks plus Windows Update filled a 128 GB volume in a day. Next time: separate data disk from the start, and a free-space check before every session.
-2. **Control updates on day one.** A lab with internet access patches itself. WSUS or a policy GPO should be in place before the first VM boots.
-3. **Static IPs and DC-only DNS for every server.** One server left on DHCP cost an hour.
-4. **Never work as the local Administrator on a domain member.** Three different failures this week (cluster validation, CA install, AD queries) came down to that.
-5. **Verify after every "success".** No output isn't the same as it worked.
-
----
-
-*Lab only: evaluation licenses, no production data.*
+*Lab environment only. Evaluation licenses, no production data.*
