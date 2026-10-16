@@ -27,7 +27,7 @@ Install-WindowsFeature RSAT-Feature-Tools-BitLocker-BdeAducExt
 #     Save recovery info to AD DS, store recovery passwords and key packages
 #     Do not enable BitLocker until recovery info is stored in AD DS
 
-# On CL01: drive was encrypted before the GPO landed, so escrow the existing key by hand
+# On CL01: push the existing recovery password to AD (needed for drives encrypted before the GPO applied)
 manage-bde -status C:
 $kp = (Get-BitLockerVolume -MountPoint C:).KeyProtector | Where-Object KeyProtectorType -eq RecoveryPassword
 Backup-BitLockerKeyProtector -MountPoint C: -KeyProtectorId $kp.KeyProtectorId
