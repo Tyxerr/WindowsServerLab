@@ -68,7 +68,7 @@
     <rect x="780" y="352" width="180" height="108" rx="10" fill="#fff" stroke="#9fb3c0"/>
     <text x="796" y="378" font-size="16" font-weight="700" fill="#0f2a36">LNX01 · .50</text>
     <text x="796" y="400" fill="#33444f">Rocky Linux 9</text>
-    <text x="796" y="420" fill="#33444f">fstab recovery</text>
+    <text x="796" y="420" fill="#33444f">AD join (realm/SSSD)</text>
     <text x="796" y="440" fill="#33444f">VHDX ↔ VMDK test</text>
   </g>
 
