@@ -25,6 +25,18 @@ Domain `lab.local`. Every Windows server runs on a differencing disk off one sys
 
 ![Hyper-V Manager and host volumes](screenshots/01-hyperv-vms-and-host-disk.png)
 
+## Build scripts
+
+The PowerShell I ran, cleaned up and in order, is in [`scripts/`](scripts):
+
+| Script | Covers |
+|---|---|
+| [01-hyperv-build.ps1](scripts/01-hyperv-build.ps1) | Internal switch + NAT, sysprepped base disk, differencing-disk VMs, Win 11 VM with vTPM, Linux Secure Boot template, DC time sync off |
+| [02-dns-dhcp.ps1](scripts/02-dns-dhcp.ps1) | Reverse zone, SRV checks, DHCP scope and failover (load balance vs hot standby) |
+| [03-ad-structure.ps1](scripts/03-ad-structure.ps1) | OUs, groups, bulk users from CSV, `redircmp`, central ADMX store, FSMO moves, health checks |
+| [04-recovery-and-security.ps1](scripts/04-recovery-and-security.ps1) | AD Recycle Bin restore, fine-grained password policy, BitLocker keys to AD |
+| [05-pki-rds.ps1](scripts/05-pki-rds.ps1) | Enterprise Root CA, duplicated Web Server template, binding the cert to RDS and the RDP listener, loopback policy |
+
 ## What I built
 
 **Hyper-V**
@@ -37,17 +49,28 @@ Domain `lab.local`. Every Windows server runs on a differencing disk off one sys
 - New forest, second DC, DNS reverse zone and SRV record checks, scavenging, DHCP failover across both DCs
 - **FSMO (Flexible Single Master Operations)** roles: transferred between DCs, and know when to seize instead
 - DC replacement: promoted DC03, moved the FSMO roles, demoted it, checked functional level
-- OU design (Users, Workstations, Servers, Groups, VDA) and bulk user creation from CSV
+- OU design (Users, Workstations, Servers, Groups, VDA) and bulk user creation from CSV, `redircmp` so new computers land in Workstations instead of the default Computers container (which can't take a GPO link)
 - AD Recycle Bin, fine-grained password policy, BitLocker recovery keys escrowed to AD
 
 **Group Policy**
 - Central ADMX store, security baseline with logon banner, firewall rules for remote GP refresh
 - Pushed policy three ways (`gpupdate`, `Invoke-GPUpdate`, GPMC by OU) and verified with `gpresult`
 - Troubleshot the common failures on purpose: wrong OU link, security filtering without Authenticated Users read, WMI filters, loopback processing, client DNS, clock skew, SYSVOL replication, group membership needing a new logon
-- Group Policy Preferences for proxy bypass and Trusted Sites
+- Group Policy Preferences for proxy bypass (`ProxyOverride` = `*.lab.local;<local>`) and Trusted Sites (Site to Zone Assignment, `https://*.lab.local` = zone 2)
+- Loopback processing in Replace mode on the session-host OU, so RDS users get session-host settings instead of their own OU's
 - DISA STIG GPO backups imported into a test OU before wider rollout
+- GPOs named by scope: `WS - Bitlocker`, `WS - Security Baseline`, `WS - Remote GP Firewall`, `USR - Drive Map`
 
 ![Group Policy Preferences registry item for proxy settings](screenshots/02-gpp-proxy-exception.png)
+
+**How I check whether a GPO applied**
+
+1. `gpresult /r /scope computer` (or `/h report.html`): is the GPO listed as applied or filtered, and which OU does the machine think it's in?
+2. GPMC › Group Policy Results on the DC for the same answer remotely. Group Policy Modeling to predict the result before moving a user or computer.
+3. Event Viewer › Applications and Services Logs › Microsoft › Windows › GroupPolicy › Operational. 4000-series events mark the start of a processing cycle and 8000-series the end, so the errors between them belong to that run.
+4. The registry: settings from Administrative Templates land in `HKLM\Software\Policies` or `HKCU\Software\Policies`. If the value is there, the GPO applied and the problem is the app.
+5. Timing: members refresh every 90 minutes plus a random 0-30, DCs every 5. A new group membership needs a new Kerberos ticket, so either log off or run `klist -li 0x3e7 purge` to clear the computer's tickets and then `gpupdate /force`, no reboot needed.
+6. Order is Local › Site › Domain › OU, and the last one applied wins unless a link higher up is Enforced. By default a client skips policy that hasn't changed. "Process even if the Group Policy objects have not changed" (Computer Config › Admin Templates › System › Group Policy › Configure registry policy processing) makes it reapply every cycle, which fixes local drift.
 
 **Clustering and storage**
 - iSCSI target on STOR01, initiators on both nodes, `Test-Cluster` validation
@@ -75,6 +98,11 @@ id user1@lab.local
 realm permit -g LinuxAdmins@lab.local
 echo '%linuxadmins@lab.local ALL=(ALL) ALL' > /etc/sudoers.d/linuxadmins
 ```
+
+I also broke LNX01 on purpose to practice recovery (RHCSA prep):
+
+- **Forgotten root password.** At GRUB, `e`, add `init=/bin/bash` to the `linux` line, Ctrl+X. Then `mount -o remount,rw /`, `passwd root`, `touch /.autorelabel` (without it SELinux blocks the new password on the next boot), and `exec /sbin/init`.
+- **Emergency mode from a bad `/etc/fstab` entry.** Log in with the root password at the emergency prompt, fix the line in `vi /etc/fstab`, `systemctl daemon-reload`, test with `mount -a` before rebooting. `nofail` on non-critical mounts keeps a missing disk from stopping the boot.
 
 ## Incident: host storage ran out and took the domain with it
 
@@ -158,6 +186,15 @@ I was asked about authoritative restores in a previous interview, so I built thi
 - **Non-authoritative**: one DC's SYSVOL is bad; it throws its copy away and pulls a fresh one from a partner. In ADSI Edit, on that DC's `CN=SYSVOL Subscription` object set `msDFSR-Enabled = FALSE`, replicate, `dfsrdiag pollad`, wait for event **4114**. Set it back to TRUE, replicate, `pollad`, and look for **4614** then **4604**. I ran this on DC02.
 - **Authoritative**: SYSVOL is bad everywhere, or every DC needs to roll back to one good copy. Stop DFSR on all DCs. On the good DC set `msDFSR-Enabled = FALSE` and `msDFSR-Options = 1`; on the rest set `msDFSR-Enabled = FALSE`. Replicate, start DFSR on the good DC (4114), set it to TRUE and `pollad` (**4602**). Then start DFSR on the others (4114), set them TRUE and `pollad` (4614, 4604). Anything changed only on the other DCs is lost, so it's the last resort.
 
+Before and after either one, check the backlog to see if the DCs are actually in sync. `dfsrdiag` isn't on a DC by default; it comes with the DFS management tools:
+
+```powershell
+Install-WindowsFeature RSAT-DFS-Mgmt-Con
+dfsrdiag backlog /rgname:"Domain System Volume" /rfname:"SYSVOL Share" /smem:DC01 /rmem:DC02
+# "No Backlog - member <dc02> is in sync with partner <dc01>"
+Get-DfsrBacklog -GroupName "Domain System Volume" -FolderName "SYSVOL Share" -SourceComputerName DC01 -DestinationComputerName DC02
+```
+
 ![DFSR events during the non-authoritative resync](screenshots/03-sysvol-dfsr-nonauth-restore.png)
 
 **AD database**
@@ -184,6 +221,22 @@ w32tm /query /source        # should name a DC, never "Local CMOS Clock" or the 
 
 On a network with no internet, the PDC's peer is an internal NTP server or GPS-disciplined clock instead.
 
+On DC02 it took three steps to get right. After `/syncfromflags:domhier` the source still read **Local CMOS Clock**. `w32tm /resync /rediscover` changed it to **VM IC Time Synchronization Provider**, which meant Hyper-V was still feeding it time. The first `Disable-VMIntegrationService` hadn't stuck, so I ran it again, checked with `Get-VMIntegrationService`, and after one more `/resync /rediscover` the source was **DC01.lab.local**.
+
+## Things that broke during the build
+
+Errors I hit, and what each one taught me:
+
+| Error | Cause / fix |
+|---|---|
+| `Add-VMDvdDrive : Unable to find a physical DVD drive matching the given criteria` | Passed `-Path L:` (a drive letter). It wants the ISO file: `-Path L:\ISO\win11.iso`. |
+| `Add-DhcpServerv4Failover : Scope 10.10.10.0 already exists on the server dc02` | I'd created the scope on both DCs. Failover copies the scope to the partner itself, so it only goes on the primary. |
+| `Move-ADDirectoryServerOperationMasterRole : The directory service is unavailable` | Failed on the first run, went through when I ran it again. `netdom query fsmo` to confirm where the roles ended up. |
+| `dcdiag` fails `DFSREvent` on a new DC | Warning/error events from the first 24 hours after SYSVOL is shared. Expected right after promotion; it clears on its own. |
+| `dfsrdiag : The term 'dfsrdiag' is not recognized` | Not installed on DCs by default. `Install-WindowsFeature RSAT-DFS-Mgmt-Con`. |
+| "The trust relationship between this workstation and the primary domain failed" | Machine password out of sync after a DC was paused. `Test-ComputerSecureChannel -Repair -Credential LAB\Administrator`: returned False the first time, True on the retry. |
+| FS02 Group Policy results full of errors | Side effect of the storage incident: fixed the host disk, restarted both DCs cleanly, repaired the secure channel. Then gpresult came back clean. |
+
 ## Commands worth knowing
 
 ```powershell
@@ -195,6 +248,12 @@ Test-ComputerSecureChannel -Server DC02     # trust check against a specific DC
 Invoke-GPUpdate -Computer CL01 -Force -RandomDelayInMinutes 0   # remote refresh without the default random delay
 gpresult /r /scope computer                 # applied GPOs and the computer's OU
 netdom query fsmo                           # FSMO role holders
+repadmin /showrepl                          # one DC's replication partners and last result
+nslookup -type=SRV _ldap._tcp.dc._msdcs.lab.local   # every DC should be listed
+dfsrdiag backlog /rgname:"Domain System Volume" /rfname:"SYSVOL Share" /smem:DC01 /rmem:DC02
+klist -li 0x3e7 purge                       # drop the computer's Kerberos tickets so new group membership applies
+Get-ADUserResultantPasswordPolicy user1     # which fine-grained password policy wins
+w32tm /query /source                        # where this machine gets time
 Get-VM | ? State -like 'Paused*' | Resume-VM
 Move-VMStorage -VMName FS02 -DestinationStoragePath M:\Lab\FS02
 Invoke-Command -VMName DC01 -Credential LAB\Administrator { ... }   # PowerShell Direct, no network needed
@@ -230,6 +289,13 @@ Get-RDCertificate -ConnectionBroker rds01.lab.local
 | Key Usage | Certificate field listing what the key may do; browsers need digital signature for TLS |
 | Enforced GPO link | A link that lower GPOs can't override (processing order: Local, Site, Domain, OU) |
 | Differencing disk | A child VHDX that stores only changes from a read-only parent |
+| Forest / schema / global catalog | The forest is the top-level AD boundary. Every domain in it shares one schema (the object classes and attributes AD allows) and one global catalog (a partial, searchable copy of every object) |
+| SRV record | DNS record giving the host and port for a service. Clients find DCs through `_ldap._tcp.dc._msdcs` |
+| Central store | ADMX templates copied into SYSVOL so every admin edits GPOs with the same set |
+| Loopback processing | Applies user settings based on the computer's OU. Replace ignores the user's own GPOs; Merge adds the computer-side ones on top |
+| DHCP failover modes | Load balance: both servers lease. Hot standby: one leases, the partner takes over after the failure timer |
+| DFSR backlog | Changes waiting to replicate between two members. Zero means in sync |
+| UCS / CIMC / Intersight | Cisco UCS combines compute, network and storage management. C-series rack servers are managed through CIMC (Cisco's iDRAC/iLO); B-series blades run through Fabric Interconnects with Service Profiles (the server's identity and config as a template). Intersight is the cloud management layer |
 | PowerShell Direct | Running commands inside a VM through Hyper-V itself, no network required |
 
 ---
